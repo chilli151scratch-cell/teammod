@@ -45,7 +45,7 @@ jobs:
                   endTime.put(id, System.currentTimeMillis() + Config.get().combatSeconds * 1000L);
                   lastAttacker.put(id, other.getUUID());
                   if (!bars.containsKey(id)) {
-                      ServerBossEvent bar = new ServerBossEvent(Component.literal("Im Kampf"),
+                      ServerBossEvent bar = new ServerBossEvent(UUID.randomUUID(), Component.literal("Im Kampf"),
                               BossEvent.BossBarColor.RED, BossEvent.BossBarOverlay.PROGRESS);
                       bar.addPlayer(p);
                       bars.put(id, bar);
@@ -890,7 +890,6 @@ jobs:
               private static PlayerTeam ensure(Scoreboard sb, TeamData.Team t) {
                   PlayerTeam pt = sb.getPlayerTeam("tm_" + t.name);
                   if (pt == null) pt = sb.addPlayerTeam("tm_" + t.name);
-                  pt.setColor(color(t));
                   pt.setPlayerPrefix(Component.literal("[" + t.name + "] ").withStyle(color(t)));
                   return pt;
               }
