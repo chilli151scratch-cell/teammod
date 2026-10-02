@@ -1,0 +1,1067 @@
+name: Team Mod Build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: 25
+          distribution: temurin
+      - name: Quellcode schreiben
+        run: |
+          rm -rf src
+          mkdir -p src/main/java/teammod
+          cat > src/main/java/teammod/Combat.java <<'EOF_TEAMMOD'
+          package teammod;
+
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerBossEvent;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.BossEvent;
+
+          import java.util.*;
+
+          public final class Combat {
+              private Combat() {}
+
+              private static final Map<UUID, Long> endTime = new HashMap<>();
+              private static final Map<UUID, UUID> lastAttacker = new HashMap<>();
+              private static final Map<UUID, ServerBossEvent> bars = new HashMap<>();
+
+              public static void onHit(ServerPlayer victim, ServerPlayer attacker) {
+                  if (TeamData.sameTeam(victim.getUUID(), attacker.getUUID())) return; // Mates loesen keinen Kampf aus
+                  tag(victim, attacker);
+                  tag(attacker, victim);
+              }
+
+              private static void tag(ServerPlayer p, ServerPlayer other) {
+                  UUID id = p.getUUID();
+                  endTime.put(id, System.currentTimeMillis() + Config.get().combatSeconds * 1000L);
+                  lastAttacker.put(id, other.getUUID());
+                  if (!bars.containsKey(id)) {
+                      ServerBossEvent bar = new ServerBossEvent(Component.literal("Im Kampf"),
+                              BossEvent.BossBarColor.RED, BossEvent.BossBarOverlay.PROGRESS);
+                      bar.addPlayer(p);
+                      bars.put(id, bar);
+                      p.sendSystemMessage(Component.literal("Du bist im Kampf! Nicht ausloggen."));
+                  }
+              }
+
+              public static void tick(MinecraftServer server) {
+                  if (endTime.isEmpty()) return;
+                  long now = System.currentTimeMillis();
+                  float total = Config.get().combatSeconds * 1000f;
+                  Iterator<Map.Entry<UUID, Long>> it = endTime.entrySet().iterator();
+                  while (it.hasNext()) {
+                      Map.Entry<UUID, Long> e = it.next();
+                      long rem = e.getValue() - now;
+                      ServerBossEvent bar = bars.get(e.getKey());
+                      if (rem <= 0) {
+                          it.remove();
+                          if (bar != null) { bar.removeAllPlayers(); bars.remove(e.getKey()); }
+                          ServerPlayer p = server.getPlayerList().getPlayer(e.getKey());
+                          if (p != null) p.sendSystemMessage(Component.literal("Kampf vorbei, du darfst dich ausloggen."));
+                      } else if (bar != null) {
+                          bar.setProgress(Math.max(0f, Math.min(1f, rem / total)));
+                          bar.setName(Component.literal("Im Kampf: " + (rem / 1000 + 1) + "s"));
+                      }
+                  }
+              }
+
+              public static void clear(UUID id) {
+                  endTime.remove(id);
+                  lastAttacker.remove(id);
+                  ServerBossEvent bar = bars.remove(id);
+                  if (bar != null) bar.removeAllPlayers();
+              }
+
+              public static void onDisconnect(MinecraftServer server, ServerPlayer p) {
+                  UUID id = p.getUUID();
+                  Long end = endTime.get(id);
+                  boolean inCombat = end != null && end > System.currentTimeMillis();
+                  UUID attacker = lastAttacker.get(id);
+                  clear(id);
+                  if (inCombat) {
+                      p.kill((ServerLevel) p.level());
+                      if (attacker != null) {
+                          TeamData.addKill(attacker);
+                          TeamData.save();
+                      }
+                      server.getPlayerList().broadcastSystemMessage(
+                              Component.literal(p.getScoreboardName() + " hat sich im Kampf ausgeloggt und wurde getoetet."), false);
+                  }
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod
+          cat > src/main/java/teammod/Config.java <<'EOF_TEAMMOD'
+          package teammod;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class Config {
+              public int teamSize = 2;
+              public int combatSeconds = 30;
+              public int tpaCooldownSeconds = 120;
+              public int tpaRequestSeconds = 60;
+
+              /** Diese Items werden geloescht, und alle Rezepte, deren ID mit der Item-ID beginnt, werden gesperrt. */
+              public List<String> bannedItems = new ArrayList<>(List.of(
+                      "minecraft:netherite_ingot", "minecraft:netherite_scrap", "minecraft:netherite_block",
+                      "minecraft:netherite_helmet", "minecraft:netherite_chestplate", "minecraft:netherite_leggings",
+                      "minecraft:netherite_boots", "minecraft:netherite_sword", "minecraft:netherite_pickaxe",
+                      "minecraft:netherite_axe", "minecraft:netherite_shovel", "minecraft:netherite_hoe",
+                      "minecraft:ancient_debris", "minecraft:end_crystal", "minecraft:respawn_anchor"));
+
+              /** Zusaetzliche Rezepte per exakter ID sperren, ohne das Item zu loeschen. */
+              public List<String> disabledRecipes = new ArrayList<>();
+
+              private static Config instance = new Config();
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+              public static Config get() { return instance; }
+
+              private static Path file() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("teammod.json");
+              }
+
+              public static void load() {
+                  try {
+                      Path f = file();
+                      if (Files.exists(f)) {
+                          Config c = GSON.fromJson(Files.readString(f), Config.class);
+                          if (c != null) instance = c;
+                      }
+                      Files.writeString(f, GSON.toJson(instance));
+                  } catch (Exception e) {
+                      System.err.println("[teammod] Config konnte nicht geladen werden: " + e);
+                  }
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod
+          cat > src/main/java/teammod/GameFreeze.java <<'EOF_TEAMMOD'
+          package teammod;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import net.fabricmc.fabric.api.event.player.*;
+          import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+          import net.minecraft.commands.CommandSourceStack;
+          import net.minecraft.commands.Commands;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.InteractionResult;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.phys.Vec3;
+
+          import java.util.HashMap;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+
+          public final class GameFreeze {
+              private GameFreeze() {}
+
+              public static boolean frozen = false;
+              private static final Map<UUID, Vec3> positions = new HashMap<>();
+
+              private static boolean blocks(Player p) {
+                  return frozen && p instanceof ServerPlayer sp && !Perm.isOp(sp);
+              }
+
+              public static void registerCommand(CommandDispatcher<CommandSourceStack> d) {
+                  d.register(Commands.literal("gamefreeze")
+                          .requires(Perm::isOp)
+                          .executes(c -> {
+                              MinecraftServer server = c.getSource().getServer();
+                              frozen = !frozen;
+                              positions.clear();
+                              if (frozen) {
+                                  for (ServerPlayer p : server.getPlayerList().getPlayers()) positions.put(p.getUUID(), p.position());
+                              }
+                              server.getCommands().performPrefixedCommand(server.createCommandSourceStack(),
+                                      frozen ? "tick freeze" : "tick unfreeze");
+                              server.getPlayerList().broadcastSystemMessage(
+                                      Component.literal(frozen ? "Das Spiel ist eingefroren." : "Das Spiel laeuft wieder."), false);
+                              return 1;
+                          }));
+              }
+
+              public static void registerEvents() {
+                  PlayerBlockBreakEvents.BEFORE.register((level, player, pos, state, be) -> !blocks(player));
+                  UseBlockCallback.EVENT.register((player, level, hand, hit) ->
+                          blocks(player) ? InteractionResult.FAIL : InteractionResult.PASS);
+                  UseItemCallback.EVENT.register((player, level, hand) ->
+                          blocks(player) ? InteractionResult.FAIL : InteractionResult.PASS);
+                  AttackEntityCallback.EVENT.register((player, level, hand, entity, hit) ->
+                          blocks(player) ? InteractionResult.FAIL : InteractionResult.PASS);
+                  UseEntityCallback.EVENT.register((player, level, hand, entity, hit) ->
+                          blocks(player) ? InteractionResult.FAIL : InteractionResult.PASS);
+              }
+
+              public static void tick(MinecraftServer server) {
+                  if (!frozen) return;
+                  for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+                      if (Perm.isOp(p)) continue;
+                      Vec3 pos = positions.computeIfAbsent(p.getUUID(), k -> p.position());
+                      if (p.position().distanceToSqr(pos) > 0.01) {
+                          p.teleportTo((ServerLevel) p.level(), pos.x, pos.y, pos.z, Set.of(), p.getYRot(), p.getXRot(), false);
+                      }
+                  }
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod
+          cat > src/main/java/teammod/Glow.java <<'EOF_TEAMMOD'
+          package teammod;
+
+          import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
+          import net.minecraft.network.syncher.EntityDataSerializers;
+          import net.minecraft.network.syncher.SynchedEntityData;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerPlayer;
+
+          import java.util.*;
+
+          /** Leuchten nur fuer den, der es eingeschaltet hat: der Server schickt das Flag nur an diesen Spieler. */
+          public final class Glow {
+              private Glow() {}
+
+              private static final Map<UUID, Set<UUID>> viewers = new HashMap<>(); // viewer -> targets
+
+              public static boolean toggle(ServerPlayer viewer, ServerPlayer target) {
+                  Set<UUID> set = viewers.computeIfAbsent(viewer.getUUID(), k -> new HashSet<>());
+                  boolean on;
+                  if (set.contains(target.getUUID())) {
+                      set.remove(target.getUUID());
+                      on = false;
+                  } else {
+                      set.add(target.getUUID());
+                      on = true;
+                  }
+                  send(viewer, target, on);
+                  return on;
+              }
+
+              public static void remove(ServerPlayer p) {
+                  viewers.remove(p.getUUID());
+              }
+
+              public static void clearAllFor(MinecraftServer server, ServerPlayer viewer) {
+                  Set<UUID> set = viewers.remove(viewer.getUUID());
+                  if (set == null) return;
+                  for (UUID id : set) {
+                      ServerPlayer t = server.getPlayerList().getPlayer(id);
+                      if (t != null) send(viewer, t, false);
+                  }
+              }
+
+              public static boolean isOn(ServerPlayer viewer, UUID target) {
+                  Set<UUID> s = viewers.get(viewer.getUUID());
+                  return s != null && s.contains(target);
+              }
+
+              private static void send(ServerPlayer viewer, ServerPlayer target, boolean glowing) {
+                  int flags = 0;
+                  if (target.isOnFire()) flags |= 1;
+                  if (target.isCrouching()) flags |= 2;
+                  if (target.isSprinting()) flags |= 8;
+                  if (target.isSwimming()) flags |= 16;
+                  if (target.isInvisible()) flags |= 32;
+                  if (glowing) flags |= 64;
+                  if (target.isFallFlying()) flags |= 128;
+                  List<SynchedEntityData.DataValue<?>> list = new ArrayList<>();
+                  list.add(new SynchedEntityData.DataValue<>(0, EntityDataSerializers.BYTE, (byte) flags));
+                  viewer.connection.send(new ClientboundSetEntityDataPacket(target.getId(), list));
+              }
+
+              public static void tick(MinecraftServer server) {
+                  if (viewers.isEmpty() || server.getTickCount() % 5 != 0) return;
+                  for (Map.Entry<UUID, Set<UUID>> e : viewers.entrySet()) {
+                      ServerPlayer viewer = server.getPlayerList().getPlayer(e.getKey());
+                      if (viewer == null) continue;
+                      for (UUID id : e.getValue()) {
+                          ServerPlayer t = server.getPlayerList().getPlayer(id);
+                          if (t != null) send(viewer, t, true);
+                      }
+                  }
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod
+          cat > src/main/java/teammod/ItemBan.java <<'EOF_TEAMMOD'
+          package teammod;
+
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.Container;
+          import net.minecraft.world.item.ItemStack;
+
+          public final class ItemBan {
+              private ItemBan() {}
+
+              public static boolean isBanned(ItemStack s) {
+                  if (s.isEmpty()) return false;
+                  return Config.get().bannedItems.contains(BuiltInRegistries.ITEM.getKey(s.getItem()).toString());
+              }
+
+              /** recipeId z.B. "minecraft:netherite_ingot_from_netherite_block" */
+              public static boolean recipeBlocked(String recipeId) {
+                  Config c = Config.get();
+                  if (c.disabledRecipes.contains(recipeId)) return true;
+                  for (String item : c.bannedItems) {
+                      if (recipeId.startsWith(item)) return true;
+                  }
+                  return false;
+              }
+
+              /** Aus "ResourceKey[minecraft:recipe / minecraft:foo]" wird "minecraft:foo". */
+              public static String recipeIdFromKey(String key) {
+                  int i = key.indexOf(" / ");
+                  if (i < 0) return key;
+                  int end = key.lastIndexOf(']');
+                  return key.substring(i + 3, end > i ? end : key.length());
+              }
+
+              public static void sweep(MinecraftServer server) {
+                  if (server.getTickCount() % 20 != 0) return;
+                  for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+                      boolean removed = clean(p.getInventory()) | clean(p.getEnderChestInventory());
+                      if (removed) p.sendSystemMessage(Component.literal("Ein verbotenes Item wurde entfernt."));
+                  }
+              }
+
+              private static boolean clean(Container c) {
+                  boolean removed = false;
+                  for (int i = 0; i < c.getContainerSize(); i++) {
+                      if (isBanned(c.getItem(i))) {
+                          c.setItem(i, ItemStack.EMPTY);
+                          removed = true;
+                      }
+                  }
+                  return removed;
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod
+          cat > src/main/java/teammod/Locator.java <<'EOF_TEAMMOD'
+          package teammod;
+
+          import net.minecraft.server.level.ServerPlayer;
+
+          import java.util.*;
+
+          /** Filter fuer die Locator-Bar (wird vom LivingEntityMixin benutzt). */
+          public final class Locator {
+              private Locator() {}
+
+              public enum Mode { ALL, MATES, SELECTED }
+
+              private static final Map<UUID, Mode> modes = new HashMap<>();
+              private static final Map<UUID, Set<UUID>> selected = new HashMap<>();
+
+              public static Mode mode(UUID viewer) { return modes.getOrDefault(viewer, Mode.ALL); }
+
+              public static boolean canSee(ServerPlayer receiver, ServerPlayer transmitter) {
+                  UUID r = receiver.getUUID();
+                  switch (mode(r)) {
+                      case MATES:
+                          return TeamData.sameTeam(r, transmitter.getUUID());
+                      case SELECTED:
+                          return selected.getOrDefault(r, Set.of()).contains(transmitter.getUUID());
+                      default:
+                          return true;
+                  }
+              }
+
+              /** Umschalten zwischen "nur Mates" und "alle". */
+              public static Mode toggle(UUID viewer) {
+                  Mode m = mode(viewer) == Mode.ALL ? Mode.MATES : Mode.ALL;
+                  modes.put(viewer, m);
+                  selected.remove(viewer);
+                  return m;
+              }
+
+              /** Einen Mate zur Auswahl hinzufuegen oder entfernen. Gibt true zurueck, wenn er jetzt sichtbar ist. */
+              public static boolean toggleOne(UUID viewer, UUID mate) {
+                  Set<UUID> set = selected.computeIfAbsent(viewer, k -> new HashSet<>());
+                  boolean now;
+                  if (set.contains(mate)) { set.remove(mate); now = false; } else { set.add(mate); now = true; }
+                  if (set.isEmpty()) {
+                      modes.put(viewer, Mode.ALL);
+                      selected.remove(viewer);
+                  } else {
+                      modes.put(viewer, Mode.SELECTED);
+                  }
+                  return now;
+              }
+
+              public static void setMates(UUID viewer) {
+                  modes.put(viewer, Mode.MATES);
+                  selected.remove(viewer);
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod
+          cat > src/main/java/teammod/Perm.java <<'EOF_TEAMMOD'
+          package teammod;
+
+          import net.minecraft.commands.CommandSourceStack;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.server.permissions.Permissions;
+
+          /** Alle OP-Pruefungen an einer Stelle. Falls hier ein Compilerfehler kommt: nur diese Datei anpassen. */
+          public final class Perm {
+              private Perm() {}
+
+              public static boolean isOp(CommandSourceStack src) {
+                  return src.permissions().hasPermission(Permissions.COMMANDS_GAMEMASTER);
+              }
+
+              public static boolean isOp(ServerPlayer p) {
+                  return p.permissions().hasPermission(Permissions.COMMANDS_GAMEMASTER);
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod
+          cat > src/main/java/teammod/TeamCommands.java <<'EOF_TEAMMOD'
+          package teammod;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import com.mojang.brigadier.context.CommandContext;
+          import com.mojang.brigadier.exceptions.CommandSyntaxException;
+          import net.minecraft.commands.CommandSourceStack;
+          import net.minecraft.commands.Commands;
+          import net.minecraft.commands.arguments.EntityArgument;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+
+          import java.util.*;
+
+          public final class TeamCommands {
+              private TeamCommands() {}
+
+              private record Invite(String team, long expires) {}
+              private record TpReq(UUID from, boolean here, long expires) {}
+
+              private static final Map<UUID, Invite> invites = new HashMap<>();
+              private static final Map<UUID, TpReq> tpReqs = new HashMap<>();
+              private static final Map<UUID, Long> tpCooldown = new HashMap<>();
+
+              public static void register(CommandDispatcher<CommandSourceStack> d) {
+                  d.register(Commands.literal("team")
+                          .then(Commands.literal("create")
+                                  .then(Commands.argument("name", StringArgumentType.word()).executes(TeamCommands::create)))
+                          .then(Commands.literal("invite")
+                                  .then(Commands.argument("player", EntityArgument.player()).executes(TeamCommands::invite)))
+                          .then(Commands.literal("accept").executes(TeamCommands::accept))
+                          .then(Commands.literal("leave").executes(TeamCommands::leave))
+                          .then(Commands.literal("glow")
+                                  .then(Commands.literal("all").executes(TeamCommands::glowAll))
+                                  .then(Commands.argument("player", EntityArgument.player()).executes(TeamCommands::glow)))
+                          .then(Commands.literal("tpa")
+                                  .then(Commands.argument("player", EntityArgument.player()).executes(c -> tpRequest(c, false))))
+                          .then(Commands.literal("tphere")
+                                  .then(Commands.argument("player", EntityArgument.player()).executes(c -> tpRequest(c, true))))
+                          .then(Commands.literal("tpaccept").executes(c -> tpAnswer(c, true)))
+                          .then(Commands.literal("tpdeny").executes(c -> tpAnswer(c, false)))
+                          .then(Commands.literal("locatorbartoggle")
+                                  .executes(TeamCommands::locatorToggle)
+                                  .then(Commands.literal("all").executes(TeamCommands::locatorAll))
+                                  .then(Commands.argument("player", EntityArgument.player()).executes(TeamCommands::locatorOne))));
+
+                  d.register(Commands.literal("teamlist").executes(TeamCommands::teamList));
+              }
+
+              // ---------- Helfer ----------
+              private static int ok(CommandContext<CommandSourceStack> c, String text) {
+                  c.getSource().sendSuccess(() -> Component.literal(text), false);
+                  return 1;
+              }
+
+              private static int err(CommandContext<CommandSourceStack> c, String text) {
+                  c.getSource().sendFailure(Component.literal(text));
+                  return 0;
+              }
+
+              private static void tp(ServerPlayer who, ServerPlayer to) {
+                  who.teleportTo((ServerLevel) to.level(), to.getX(), to.getY(), to.getZ(), Set.of(), to.getYRot(), to.getXRot(), true);
+              }
+
+              /** Holt das Ziel und prueft, dass es ein Mate ist. Gibt null zurueck und sendet eine Fehlermeldung sonst. */
+              private static ServerPlayer mate(CommandContext<CommandSourceStack> c, ServerPlayer me) throws CommandSyntaxException {
+                  ServerPlayer target = EntityArgument.getPlayer(c, "player");
+                  if (target == me) { err(c, "Das bist du selbst."); return null; }
+                  if (!TeamData.sameTeam(me.getUUID(), target.getUUID())) { err(c, target.getScoreboardName() + " ist nicht in deinem Team."); return null; }
+                  return target;
+              }
+
+              // ---------- Teams ----------
+              private static int create(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+                  ServerPlayer p = c.getSource().getPlayerOrException();
+                  String name = StringArgumentType.getString(c, "name");
+                  if (TeamData.teamOf(p.getUUID()) != null) return err(c, "Du bist schon in einem Team.");
+                  if (!name.matches("[A-Za-z0-9_]{2,12}")) return err(c, "Teamname: 2-12 Zeichen (Buchstaben, Zahlen, _).");
+                  if (TeamData.find(name) != null) return err(c, "Den Teamnamen gibt es schon.");
+                  TeamData.create(name, p.getUUID());
+                  MinecraftServer s = c.getSource().getServer();
+                  Teams.syncPlayer(s, p);
+                  Teams.refreshTab(s);
+                  return ok(c, "Team " + name + " erstellt. Lade Mates mit /team invite <Name> ein.");
+              }
+
+              private static int invite(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+                  ServerPlayer p = c.getSource().getPlayerOrException();
+                  ServerPlayer target = EntityArgument.getPlayer(c, "player");
+                  TeamData.Team t = TeamData.teamOf(p.getUUID());
+                  if (t == null) return err(c, "Du bist in keinem Team.");
+                  if (t.members.size() >= Config.get().teamSize) return err(c, "Dein Team ist voll (max. " + Config.get().teamSize + ").");
+                  if (TeamData.teamOf(target.getUUID()) != null) return err(c, target.getScoreboardName() + " ist schon in einem Team.");
+                  invites.put(target.getUUID(), new Invite(t.name, System.currentTimeMillis() + 60_000L));
+                  target.sendSystemMessage(Component.literal(p.getScoreboardName() + " hat dich in das Team " + t.name
+                          + " eingeladen. Annehmen mit /team accept (60 Sekunden)."));
+                  return ok(c, "Einladung an " + target.getScoreboardName() + " gesendet.");
+              }
+
+              private static int accept(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+                  ServerPlayer p = c.getSource().getPlayerOrException();
+                  Invite inv = invites.remove(p.getUUID());
+                  if (inv == null || inv.expires() < System.currentTimeMillis()) return err(c, "Du hast keine offene Einladung.");
+                  TeamData.Team t = TeamData.find(inv.team());
+                  if (t == null) return err(c, "Das Team gibt es nicht mehr.");
+                  if (TeamData.teamOf(p.getUUID()) != null) return err(c, "Du bist schon in einem Team.");
+                  if (t.members.size() >= Config.get().teamSize) return err(c, "Das Team ist voll.");
+                  t.members.add(p.getUUID().toString());
+                  TeamData.save();
+                  MinecraftServer s = c.getSource().getServer();
+                  Teams.syncPlayer(s, p);
+                  Teams.refreshTab(s);
+                  return ok(c, "Du bist jetzt im Team " + t.name + ".");
+              }
+
+              private static int leave(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+                  ServerPlayer p = c.getSource().getPlayerOrException();
+                  if (TeamData.teamOf(p.getUUID()) == null) return err(c, "Du bist in keinem Team.");
+                  TeamData.removeMember(p.getUUID());
+                  MinecraftServer s = c.getSource().getServer();
+                  Teams.sync(s, p.getScoreboardName(), null);
+                  Glow.clearAllFor(s, p);
+                  Teams.refreshTab(s);
+                  return ok(c, "Du hast das Team verlassen.");
+              }
+
+              // ---------- Glow ----------
+              private static int glow(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+                  ServerPlayer p = c.getSource().getPlayerOrException();
+                  ServerPlayer t = mate(c, p);
+                  if (t == null) return 0;
+                  boolean on = Glow.toggle(p, t);
+                  return ok(c, t.getScoreboardName() + " leuchtet fuer dich jetzt " + (on ? "an." : "aus."));
+              }
+
+              private static int glowAll(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+                  ServerPlayer p = c.getSource().getPlayerOrException();
+                  TeamData.Team team = TeamData.teamOf(p.getUUID());
+                  if (team == null) return err(c, "Du bist in keinem Team.");
+                  MinecraftServer s = c.getSource().getServer();
+                  List<ServerPlayer> mates = new ArrayList<>();
+                  for (String id : team.members) {
+                      ServerPlayer m = s.getPlayerList().getPlayer(UUID.fromString(id));
+                      if (m != null && m != p) mates.add(m);
+                  }
+                  boolean anyOff = false;
+                  for (ServerPlayer m : mates) if (!Glow.isOn(p, m.getUUID())) anyOff = true;
+                  for (ServerPlayer m : mates) if (Glow.isOn(p, m.getUUID()) != anyOff) Glow.toggle(p, m);
+                  return ok(c, "Alle Mates leuchten fuer dich jetzt " + (anyOff ? "an." : "aus."));
+              }
+
+              // ---------- Teleport ----------
+              private static int tpRequest(CommandContext<CommandSourceStack> c, boolean here) throws CommandSyntaxException {
+                  ServerPlayer p = c.getSource().getPlayerOrException();
+                  ServerPlayer t = mate(c, p);
+                  if (t == null) return 0;
+                  long now = System.currentTimeMillis();
+                  long until = tpCooldown.getOrDefault(p.getUUID(), 0L);
+                  if (until > now) return err(c, "Cooldown: noch " + ((until - now) / 1000 + 1) + " Sekunden.");
+                  tpCooldown.put(p.getUUID(), now + Config.get().tpaCooldownSeconds * 1000L);
+                  tpReqs.put(t.getUUID(), new TpReq(p.getUUID(), here, now + Config.get().tpaRequestSeconds * 1000L));
+                  t.sendSystemMessage(Component.literal(p.getScoreboardName()
+                          + (here ? " moechte, dass du dich zu ihm teleportierst." : " moechte sich zu dir teleportieren.")
+                          + " /team tpaccept oder /team tpdeny"));
+                  return ok(c, "Anfrage an " + t.getScoreboardName() + " gesendet.");
+              }
+
+              private static int tpAnswer(CommandContext<CommandSourceStack> c, boolean accept) throws CommandSyntaxException {
+                  ServerPlayer p = c.getSource().getPlayerOrException();
+                  TpReq r = tpReqs.remove(p.getUUID());
+                  if (r == null || r.expires() < System.currentTimeMillis()) return err(c, "Keine offene Anfrage.");
+                  ServerPlayer from = c.getSource().getServer().getPlayerList().getPlayer(r.from());
+                  if (from == null) return err(c, "Der Spieler ist nicht mehr online.");
+                  if (!accept) {
+                      from.sendSystemMessage(Component.literal(p.getScoreboardName() + " hat die Anfrage abgelehnt."));
+                      return ok(c, "Anfrage abgelehnt.");
+                  }
+                  if (r.here()) tp(p, from); else tp(from, p);
+                  from.sendSystemMessage(Component.literal(p.getScoreboardName() + " hat angenommen."));
+                  return ok(c, "Teleport ausgefuehrt.");
+              }
+
+              // ---------- Locator-Bar ----------
+              private static int locatorToggle(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+                  ServerPlayer p = c.getSource().getPlayerOrException();
+                  Locator.Mode m = Locator.toggle(p.getUUID());
+                  return ok(c, m == Locator.Mode.MATES ? "Locator-Bar: nur dein Team." : "Locator-Bar: alle Spieler.");
+              }
+
+              private static int locatorAll(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+                  ServerPlayer p = c.getSource().getPlayerOrException();
+                  Locator.setMates(p.getUUID());
+                  return ok(c, "Locator-Bar: alle Mates aus deinem Team.");
+              }
+
+              private static int locatorOne(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+                  ServerPlayer p = c.getSource().getPlayerOrException();
+                  ServerPlayer t = mate(c, p);
+                  if (t == null) return 0;
+                  boolean now = Locator.toggleOne(p.getUUID(), t.getUUID());
+                  return ok(c, t.getScoreboardName() + " ist auf deiner Locator-Bar jetzt " + (now ? "sichtbar." : "ausgeblendet."));
+              }
+
+              // ---------- /teamlist ----------
+              private static int teamList(CommandContext<CommandSourceStack> c) {
+                  if (TeamData.all().isEmpty()) return ok(c, "Es gibt noch keine Teams.");
+                  for (TeamData.Team t : TeamData.all()) {
+                      int k = 0, de = 0;
+                      List<String> lines = new ArrayList<>();
+                      for (String id : t.members) {
+                          UUID u = UUID.fromString(id);
+                          k += TeamData.kills(u);
+                          de += TeamData.deaths(u);
+                          lines.add("  " + TeamData.names.getOrDefault(id, "?") + ": " + TeamData.kills(u) + " Kills, " + TeamData.deaths(u) + " Deaths");
+                      }
+                      String head = "[" + t.name + "] " + k + " Kills, " + de + " Deaths";
+                      c.getSource().sendSuccess(() -> Component.literal(head).withStyle(Teams.color(t)), false);
+                      for (String l : lines) c.getSource().sendSuccess(() -> Component.literal(l), false);
+                  }
+                  return 1;
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod
+          cat > src/main/java/teammod/TeamData.java <<'EOF_TEAMMOD'
+          package teammod;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.*;
+
+          public class TeamData {
+              public static class Team {
+                  public String name;
+                  public int colorIndex;
+                  public String leader;
+                  public List<String> members = new ArrayList<>();
+              }
+
+              public Map<String, Team> teams = new LinkedHashMap<>();
+              public Map<String, int[]> stats = new HashMap<>();   // uuid -> [kills, deaths]
+              public Map<String, String> playerNames = new HashMap<>();
+              public int nextColor = 0;
+
+              private static TeamData data = new TeamData();
+              /** Kurzzugriff auf die Namen-Map. */
+              public static Map<String, String> names = data.playerNames;
+
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+              private static Path file() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("teammod-data.json");
+              }
+
+              public static void load() {
+                  try {
+                      Path f = file();
+                      if (Files.exists(f)) {
+                          TeamData d = GSON.fromJson(Files.readString(f), TeamData.class);
+                          if (d != null) {
+                              data = d;
+                              if (data.playerNames == null) data.playerNames = new HashMap<>();
+                              names = data.playerNames;
+                          }
+                      }
+                  } catch (Exception e) {
+                      System.err.println("[teammod] Daten konnten nicht geladen werden: " + e);
+                  }
+              }
+
+              public static void save() {
+                  try {
+                      Files.writeString(file(), GSON.toJson(data));
+                  } catch (Exception e) {
+                      System.err.println("[teammod] Daten konnten nicht gespeichert werden: " + e);
+                  }
+              }
+
+              public static Collection<Team> all() { return data.teams.values(); }
+
+              public static Team find(String name) {
+                  for (Team t : data.teams.values()) if (t.name.equalsIgnoreCase(name)) return t;
+                  return null;
+              }
+
+              public static Team teamOf(UUID uuid) {
+                  String id = uuid.toString();
+                  for (Team t : data.teams.values()) if (t.members.contains(id)) return t;
+                  return null;
+              }
+
+              public static boolean sameTeam(UUID a, UUID b) {
+                  Team t = teamOf(a);
+                  return t != null && t.members.contains(b.toString());
+              }
+
+              public static Team create(String name, UUID leader) {
+                  Team t = new Team();
+                  t.name = name;
+                  t.colorIndex = data.nextColor++;
+                  t.leader = leader.toString();
+                  t.members.add(leader.toString());
+                  data.teams.put(name.toLowerCase(), t);
+                  save();
+                  return t;
+              }
+
+              /** Entfernt den Spieler; loescht das Team, wenn es leer ist. Gibt das Team zurueck (oder null). */
+              public static Team removeMember(UUID uuid) {
+                  Team t = teamOf(uuid);
+                  if (t == null) return null;
+                  t.members.remove(uuid.toString());
+                  if (t.members.isEmpty()) {
+                      data.teams.remove(t.name.toLowerCase());
+                  } else if (t.leader.equals(uuid.toString())) {
+                      t.leader = t.members.get(0);
+                  }
+                  save();
+                  return t;
+              }
+
+              public static int kills(UUID u) { return data.stats.getOrDefault(u.toString(), new int[2])[0]; }
+              public static int deaths(UUID u) { return data.stats.getOrDefault(u.toString(), new int[2])[1]; }
+              public static void addKill(UUID u) { data.stats.computeIfAbsent(u.toString(), k -> new int[2])[0]++; }
+              public static void addDeath(UUID u) { data.stats.computeIfAbsent(u.toString(), k -> new int[2])[1]++; }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod
+          cat > src/main/java/teammod/TeamMod.java <<'EOF_TEAMMOD'
+          package teammod;
+
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+          import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.entity.item.ItemEntity;
+
+          public class TeamMod implements ModInitializer {
+              public static final String MOD_ID = "teammod";
+
+              @Override
+              public void onInitialize() {
+                  Config.load();
+                  TeamData.load();
+
+                  CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, env) -> {
+                      TeamCommands.register(dispatcher);
+                      GameFreeze.registerCommand(dispatcher);
+                  });
+
+                  ServerLifecycleEvents.SERVER_STARTED.register(Teams::syncAll);
+                  ServerLifecycleEvents.SERVER_STOPPING.register(s -> TeamData.save());
+
+                  ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+                      ServerPlayer p = handler.getPlayer();
+                      TeamData.names.put(p.getUUID().toString(), p.getScoreboardName());
+                      Teams.syncPlayer(server, p);
+                      Teams.refreshTab(server);
+                  });
+                  ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+                      ServerPlayer p = handler.getPlayer();
+                      Combat.onDisconnect(server, p);
+                      Glow.remove(p);
+                  });
+
+                  // Kills und Deaths
+                  ServerLivingEntityEvents.AFTER_DEATH.register((entity, source) -> {
+                      if (entity instanceof ServerPlayer victim) {
+                          TeamData.addDeath(victim.getUUID());
+                          if (source.getEntity() instanceof ServerPlayer killer && killer != victim) {
+                              TeamData.addKill(killer.getUUID());
+                          }
+                          Combat.clear(victim.getUUID());
+                          TeamData.save();
+                          Teams.refreshTab(victim.level().getServer());
+                      }
+                  });
+
+                  // Combat-Logging: Treffer von Spieler zu Spieler
+                  ServerLivingEntityEvents.AFTER_DAMAGE.register((entity, source, base, taken, blocked) -> {
+                      if (entity instanceof ServerPlayer victim && source.getEntity() instanceof ServerPlayer attacker && attacker != victim) {
+                          Combat.onHit(victim, attacker);
+                      }
+                  });
+
+                  // Waehrend /gamefreeze kein Schaden fuer Nicht-OPs
+                  ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) ->
+                          !(entity instanceof ServerPlayer p && GameFreeze.frozen && !Perm.isOp(p)));
+
+                  // Verbotene Items am Boden loeschen
+                  ServerEntityEvents.ENTITY_LOAD.register((entity, level) -> {
+                      if (entity instanceof ItemEntity ie && ItemBan.isBanned(ie.getItem())) {
+                          level.getServer().execute(ie::discard);
+                      }
+                  });
+
+                  ServerTickEvents.END_SERVER_TICK.register(server -> {
+                      Combat.tick(server);
+                      Glow.tick(server);
+                      GameFreeze.tick(server);
+                      ItemBan.sweep(server);
+                  });
+
+                  GameFreeze.registerEvents();
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod
+          cat > src/main/java/teammod/Teams.java <<'EOF_TEAMMOD'
+          package teammod;
+
+          import net.minecraft.ChatFormatting;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.network.chat.MutableComponent;
+          import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.scores.PlayerTeam;
+          import net.minecraft.world.scores.Scoreboard;
+
+          import java.util.EnumSet;
+
+          public final class Teams {
+              private Teams() {}
+
+              public static final ChatFormatting[] COLORS = {
+                      ChatFormatting.RED, ChatFormatting.BLUE, ChatFormatting.GREEN, ChatFormatting.YELLOW,
+                      ChatFormatting.AQUA, ChatFormatting.LIGHT_PURPLE, ChatFormatting.GOLD, ChatFormatting.DARK_GREEN,
+                      ChatFormatting.DARK_AQUA, ChatFormatting.DARK_PURPLE
+              };
+
+              public static ChatFormatting color(TeamData.Team t) {
+                  return COLORS[t.colorIndex % COLORS.length];
+              }
+
+              private static PlayerTeam ensure(Scoreboard sb, TeamData.Team t) {
+                  PlayerTeam pt = sb.getPlayerTeam("tm_" + t.name);
+                  if (pt == null) pt = sb.addPlayerTeam("tm_" + t.name);
+                  pt.setColor(color(t));
+                  pt.setPlayerPrefix(Component.literal("[" + t.name + "] ").withStyle(color(t)));
+                  return pt;
+              }
+
+              /** Setzt den Spieler (per Name) in das passende Scoreboard-Team. Das sortiert die Tab-Liste. */
+              public static void sync(MinecraftServer server, String playerName, TeamData.Team t) {
+                  Scoreboard sb = server.getScoreboard();
+                  PlayerTeam cur = sb.getPlayersTeam(playerName);
+                  String want = t == null ? null : "tm_" + t.name;
+                  if (cur != null && cur.getName().startsWith("tm_") && !cur.getName().equals(want)) {
+                      sb.removePlayerFromTeam(playerName, cur);
+                      if (cur.getPlayers().isEmpty()) sb.removePlayerTeam(cur);
+                      cur = null;
+                  }
+                  if (t != null) {
+                      PlayerTeam pt = ensure(sb, t);
+                      if (cur == null || !cur.getName().equals(want)) sb.addPlayerToTeam(playerName, pt);
+                  }
+              }
+
+              public static void syncPlayer(MinecraftServer server, ServerPlayer p) {
+                  sync(server, p.getScoreboardName(), TeamData.teamOf(p.getUUID()));
+              }
+
+              public static void syncAll(MinecraftServer server) {
+                  for (TeamData.Team t : TeamData.all()) {
+                      ensure(server.getScoreboard(), t);
+                      for (String id : t.members) {
+                          String n = TeamData.names.get(id);
+                          if (n != null) sync(server, n, t);
+                      }
+                  }
+              }
+
+              /** Anzeigename in der Tab-Liste: [Team] Name  Totenkopf Deaths  Schwert Kills */
+              public static Component tabName(ServerPlayer p) {
+                  TeamData.Team t = TeamData.teamOf(p.getUUID());
+                  ChatFormatting col = t == null ? ChatFormatting.WHITE : color(t);
+                  MutableComponent c = Component.empty();
+                  if (t != null) c.append(Component.literal("[" + t.name + "] ").withStyle(col));
+                  c.append(Component.literal(p.getScoreboardName()).withStyle(col));
+                  c.append(Component.literal("  \u2620 " + TeamData.deaths(p.getUUID())).withStyle(ChatFormatting.GRAY));
+                  c.append(Component.literal("  \u2694 " + TeamData.kills(p.getUUID())).withStyle(ChatFormatting.GRAY));
+                  return c;
+              }
+
+              public static void refreshTab(MinecraftServer server) {
+                  if (server == null) return;
+                  server.getPlayerList().broadcastAll(new ClientboundPlayerInfoUpdatePacket(
+                          EnumSet.of(ClientboundPlayerInfoUpdatePacket.Action.UPDATE_DISPLAY_NAME),
+                          server.getPlayerList().getPlayers()));
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod/mixin
+          cat > src/main/java/teammod/mixin/LivingEntityMixin.java <<'EOF_TEAMMOD'
+          package teammod.mixin;
+
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.entity.LivingEntity;
+          import net.minecraft.world.waypoints.WaypointTransmitter;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+          import teammod.Locator;
+
+          import java.util.Optional;
+
+          /** Locator-Bar: blendet Spieler fuer einzelne Empfaenger aus. */
+          @Mixin(LivingEntity.class)
+          public abstract class LivingEntityMixin {
+              @Inject(method = "makeWaypointConnectionWith", at = @At("HEAD"), cancellable = true)
+              private void teammod$locator(ServerPlayer receiver,
+                                           CallbackInfoReturnable<Optional<WaypointTransmitter.Connection>> cir) {
+                  if ((Object) this instanceof ServerPlayer transmitter && !Locator.canSee(receiver, transmitter)) {
+                      cir.setReturnValue(Optional.empty());
+                  }
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod/mixin
+          cat > src/main/java/teammod/mixin/RecipeMapMixin.java <<'EOF_TEAMMOD'
+          package teammod.mixin;
+
+          import net.minecraft.world.item.crafting.RecipeHolder;
+          import net.minecraft.world.item.crafting.RecipeMap;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.ModifyVariable;
+          import teammod.ItemBan;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /** Filtert gesperrte Rezepte beim Laden heraus. */
+          @Mixin(RecipeMap.class)
+          public class RecipeMapMixin {
+              @ModifyVariable(method = "create", at = @At("HEAD"), argsOnly = true)
+              private static Iterable<RecipeHolder<?>> teammod$filter(Iterable<RecipeHolder<?>> in) {
+                  List<RecipeHolder<?>> out = new ArrayList<>();
+                  for (RecipeHolder<?> h : in) {
+                      String id = ItemBan.recipeIdFromKey(h.id().toString());
+                      if (!ItemBan.recipeBlocked(id)) out.add(h);
+                  }
+                  return out;
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/java/teammod/mixin
+          cat > src/main/java/teammod/mixin/ServerPlayerMixin.java <<'EOF_TEAMMOD'
+          package teammod.mixin;
+
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.level.ServerPlayer;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+          import teammod.Teams;
+
+          /** Tab-Liste: Teamname, Farbe, Tode und Kills im Namen. */
+          @Mixin(ServerPlayer.class)
+          public class ServerPlayerMixin {
+              @Inject(method = "getTabListDisplayName", at = @At("HEAD"), cancellable = true)
+              private void teammod$tabName(CallbackInfoReturnable<Component> cir) {
+                  cir.setReturnValue(Teams.tabName((ServerPlayer) (Object) this));
+              }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'EOF_TEAMMOD'
+          {
+            "schemaVersion": 1,
+            "id": "teammod",
+            "version": "1.0.0",
+            "name": "Team Mod",
+            "description": "Teams, Combat-Logging, Tab-Liste, Item-Sperren und mehr fuer 2vs2.",
+            "environment": "server",
+            "entrypoints": {
+              "main": ["teammod.TeamMod"]
+            },
+            "mixins": ["teammod.mixins.json"],
+            "depends": {
+              "fabricloader": "*",
+              "fabric-api": "*"
+            }
+          }
+          EOF_TEAMMOD
+          mkdir -p src/main/resources
+          cat > src/main/resources/teammod.mixins.json <<'EOF_TEAMMOD'
+          {
+            "required": true,
+            "package": "teammod.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "mixins": [
+              "ServerPlayerMixin",
+              "RecipeMapMixin",
+              "LivingEntityMixin"
+            ],
+            "injectors": {
+              "defaultRequire": 0
+            }
+          }
+          EOF_TEAMMOD
+
+      - name: Bauen
+        run: |
+          chmod +x gradlew
+          ./gradlew build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: teammod-jar
+          path: build/libs/
